@@ -2,7 +2,6 @@ import requests
 import json
 from urllib.parse import quote
 from itertools import chain
-import fuzzywuzzy
 from fuzzywuzzy import fuzz
 from mutagen.mp4 import MP4
 import numpy as np
@@ -26,19 +25,21 @@ def parse_163_artist_dict(artist_dict: dict) -> list[str]:
 def match_163_search_result(name: str, duration: float, result: dict, 
                             artist: str | None = None, album: str | None = None,
                             name_weight: float = 0.7, album_weight: float = 0.2, artist_weight: float = 0.1,
-                            duration_threshold: float = 15.0) -> float:
+                            full_match_weight: float = 0.2, duration_threshold: float = 15.0) -> float:
     '''
     根据歌曲名、艺术家、专辑返回匹配分数
     
     duration_threshold: 若时长相差超过该值，则强制返回0，单位为秒
     '''
+    def fuzz_match(str1: str, str2: str):
+        return fuzz.partial_ratio(str1, str2) * (1 - full_match_weight) + fuzz.ratio(str1, str2) * full_match_weight
     if(np.abs(result['dt'] / 1000 - duration) > duration_threshold):
         return 0.
     if('alia' in result):
         result_names = [result['name'], *result['alia']]
-        score = {'name': np.max([fuzz.partial_ratio(name, res_name) for res_name in result_names])}
+        score = {'name': np.max([fuzz_match(name, res_name) for res_name in result_names])}
     else:
-        score = {'name': fuzz.partial_ratio(name, result['name'])}
+        score = {'name': fuzz_match(name, result['name'])}
         
     if(artist is None):
         artist_weight = 0
@@ -46,14 +47,14 @@ def match_163_search_result(name: str, duration: float, result: dict,
     else:
         result_artists = [parse_163_artist_dict(d) for d in result['ar']]
         result_artists = list(chain(*result_artists))
-        score['artist'] = np.max([fuzz.partial_ratio(artist, res_artist) for res_artist in result_artists])
+        score['artist'] = np.max([fuzz_match(artist, res_artist) for res_artist in result_artists])
     
     if((album is None) or ('al' not in result)):
         album_weight = 0
         score['album'] = 0
     else:
         result_albums = [result['al']['name'], *result['al']['tns']]
-        score['album'] = np.max([fuzz.partial_ratio(album, res_album) for res_album in result_albums])
+        score['album'] = np.max([fuzz_match(album, res_album) for res_album in result_albums])
         
     return (name_weight * score['name'] + artist_weight * score['artist'] + album_weight * score['album'])/(name_weight + artist_weight + album_weight)
     
@@ -83,8 +84,8 @@ def search_163_music_file(file: os.PathLike):
     return search_163_music(name, duration, artist, album)
 
 if __name__ == '__main__':
-    song = "music-source/Lasting Moment_久岛鸥ver.m4a"
+    song = "music-source/同じ空の下で.m4a"
     res = search_163_music_file(song)
     print(res)
-    with open("163example.json", 'w') as f:
+    with open("example.json", 'w') as f:
         json.dump(res, f, indent=4, ensure_ascii=False)
