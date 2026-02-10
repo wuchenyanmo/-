@@ -8,6 +8,13 @@ import numpy as np
 import pandas as pd
 import os
 
+HEADER = {'User-Agent':"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"}
+SEARCH_LIMIT = 20
+# 第三方网易云搜索API，信息更全
+SEARCH_163_API_THIRD = "https://apis.netstart.cn/music/cloudsearch?keywords={name}"
+# 官方网易云搜索API
+SEARCH_163_API = "https://music.163.com/api/search/get?s={name}&type=1&offset=0&limit={limit}"
+
 def parse_163_artist_dict(artist_dict: dict) -> list[str]:
     '''
     解析返回结果'ar'属性中的单个对象，返回包括歌手名字、翻译名字、别名在内的列表，去除重复
@@ -63,8 +70,7 @@ def search_163_music(name: str,
                      duration: float,
                      artist: str | None = None,
                      album: str | None = None):
-    HEADER = {'User-Agent':"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"}
-    url = f"https://apis.netstart.cn/music/cloudsearch?keywords={quote(name)}"
+    url = SEARCH_163_API_THIRD.format(name = quote(name))
     response = requests.get(url,headers = HEADER, timeout = (5, 7))
     res = response.json()
     
