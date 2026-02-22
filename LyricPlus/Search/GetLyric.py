@@ -18,9 +18,9 @@ def get_163_lyric(song_id: str | int) -> LyricLineStamp | None:
         return None
     if("pureMusic" in res and res["pureMusic"]):
         return None
+    if(not res['lrc']['lyric']):
+        return None
     lyr = LyricLineStamp(res['lrc']['lyric'])
-    if("tlyric" not in res):
-        return lyr
-    else:
+    if("tlyric" in res and res['tlyric']['lyric']):
         lyr.load_translation(res['tlyric']['lyric'])
-        return lyr
+    return lyr
