@@ -88,10 +88,3 @@ def search_163_music_file(file: os.PathLike):
     album = audio.tags['©alb'][0]
     duration = audio.info.length
     return search_163_music(name, duration, artist, album)
-
-if __name__ == '__main__':
-    song = "music-source/同じ空の下で.m4a"
-    res = search_163_music_file(song)
-    print(res)
-    with open("example.json", 'w') as f:
-        json.dump(res, f, indent=4, ensure_ascii=False)
