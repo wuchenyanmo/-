@@ -3,7 +3,7 @@
 model
 music-source/*
 test*
-debug-plots/*
+debug-*/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
