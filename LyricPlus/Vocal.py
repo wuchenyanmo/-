@@ -190,6 +190,7 @@ class VocalAnalyzer:
         max_gap_sec: float = 0.22,
         max_segment_sec: float = 8.0,
         long_valley_threshold: float = 0.30,
+        low_memory_mode: bool = False,
     ):
         """
         初始化分析器。
@@ -205,6 +206,7 @@ class VocalAnalyzer:
             max_gap_sec: 允许合并的短停顿时长。
             max_segment_sec: 最大片段时长。
             long_valley_threshold: 长片段二次切分的谷值阈值。
+            low_memory_mode: 是否启用低显存模式；启用后建议在人声分析阶段结束后主动卸载 Demucs。
         """
         self.frame_length = frame_length
         self.hop_length = hop_length
@@ -216,6 +218,7 @@ class VocalAnalyzer:
         self.max_gap_sec = max_gap_sec
         self.max_segment_sec = max_segment_sec
         self.long_valley_threshold = long_valley_threshold
+        self.low_memory_mode = low_memory_mode
 
     @staticmethod
     def get_model():
@@ -237,7 +240,6 @@ class VocalAnalyzer:
         说明:
             当前分离流程使用了全局缓存模型以便重复调用时更快，
             但在“先分离、再转写”的链路里，这会导致 Demucs 和 Whisper 同时驻留在 GPU。
-            对 6GB 显存设备，这通常就是显存峰值接近 9GB 的主要原因。
         """
         global _model
         if _model is None:
@@ -250,6 +252,13 @@ class VocalAnalyzer:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def release_model_if_needed(self):
+        """
+        按当前模式决定是否释放 Demucs 模型。
+        """
+        if self.low_memory_mode:
+            self.release_model()
 
     @staticmethod
     def ensure_stereo_44k(waveform: torch.Tensor, sr: int) -> tuple[torch.Tensor, int]:

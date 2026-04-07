@@ -222,6 +222,7 @@ class WhisperTranscriber:
         max_previous_chunks: int = 2,
         max_lyric_hint_chars: int = 80,
         num_candidates: int = 1,
+        low_memory_mode: bool = False,
     ):
         """
         初始化 Whisper 转写器。
@@ -241,6 +242,7 @@ class WhisperTranscriber:
             max_previous_chunks: 最多回看多少个历史片段作为 prompt。
             max_lyric_hint_chars: 歌词提示的长度上限。
             num_candidates: 同一分片重复转写的候选次数。
+            low_memory_mode: 是否启用低显存模式；启用后在整条链路结束时建议主动卸载 Whisper。
         """
         self.model_id = model_id
         self.language = language
@@ -256,6 +258,7 @@ class WhisperTranscriber:
         self.max_previous_chunks = max_previous_chunks
         self.max_lyric_hint_chars = max_lyric_hint_chars
         self.num_candidates = max(1, int(num_candidates))
+        self.low_memory_mode = low_memory_mode
 
         self.model = None
         self.processor = None
@@ -295,6 +298,13 @@ class WhisperTranscriber:
         self.model = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def unload_model_if_needed(self):
+        """
+        按当前模式决定是否释放 Whisper 模型。
+        """
+        if self.low_memory_mode:
+            self.unload_model()
 
     @staticmethod
     def _coerce_segment(segment: VocalSegment | dict) -> dict:
