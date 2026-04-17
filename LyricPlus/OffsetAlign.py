@@ -22,7 +22,7 @@ class OffsetAnchor:
     delta: float
     prefix_similarity: float
     full_similarity: float
-    chunk_quality: float
+    chunk_confidence: float | None
     score: float
     chunk_text: str
 
@@ -37,7 +37,7 @@ class OffsetAnchor:
             "delta": self.delta,
             "prefix_similarity": self.prefix_similarity,
             "full_similarity": self.full_similarity,
-            "chunk_quality": self.chunk_quality,
+            "chunk_confidence": self.chunk_confidence,
             "score": self.score,
             "chunk_text": self.chunk_text,
         }
@@ -50,13 +50,12 @@ class OffsetAligner:
 
     def __init__(
         self,
-        min_prefix_similarity: float = 0.84,
-        min_full_similarity: float = 0.72,
-        min_chunk_quality: float = 0.18,
+        min_prefix_similarity: float = 0.68,
+        min_full_similarity: float = 0.50,
         min_anchor_count: int = 3,
         min_section_anchor_count: int = 2,
         min_merged_section_chunks: int = 5,
-        max_section_merge_gap_sec: float = 5.0,
+        max_section_merge_gap_sec: float = 3.0,
         max_delta_spread: float = 1.0,
         max_section_mad: float = 0.35,
         min_length_ratio: float = 0.55,
@@ -65,7 +64,6 @@ class OffsetAligner:
     ):
         self.min_prefix_similarity = min_prefix_similarity
         self.min_full_similarity = min_full_similarity
-        self.min_chunk_quality = min_chunk_quality
         self.min_anchor_count = min_anchor_count
         self.min_section_anchor_count = min_section_anchor_count
         self.min_merged_section_chunks = min_merged_section_chunks
@@ -104,39 +102,20 @@ class OffsetAligner:
         text = re.split(r"[【\[\(（「『]", text, maxsplit=1)[0]
         return LyricLineStamp.normalize_lyric_text(text)
 
-    @staticmethod
-    def _chunk_quality(chunk: WhisperChunkResult) -> float:
-        avg_confidence = float(chunk.avg_confidence or 0.0)
-        min_token = float(chunk.min_token_confidence or 0.0)
-        low_conf_ratio = float(chunk.low_conf_token_ratio or 0.0)
-        vocal_presence = float(chunk.scores.get("vocal_presence", 0.0))
-        off_center = float(chunk.scores.get("off_center_risk", 0.0))
-        return (
-            1.05 * avg_confidence
-            + 0.30 * min_token
-            + 0.28 * vocal_presence
-            - 1.25 * float(chunk.hallucination_risk)
-            - 0.32 * float(chunk.self_repeat_score)
-            - 0.18 * low_conf_ratio
-            - 0.12 * off_center
-        )
-
     def _chunk_is_eligible(self, chunk: WhisperChunkResult) -> bool:
         if not chunk.text:
             return False
-        if float(chunk.avg_confidence or 0.0) < 0.55:
+        if float(chunk.avg_confidence or 0.0) < 0.42:
             return False
-        if float(chunk.hallucination_risk) > 0.30:
+        if float(chunk.hallucination_risk) > 0.55:
             return False
-        if chunk.min_token_confidence is not None and float(chunk.min_token_confidence) < 0.12:
+        if chunk.min_token_confidence is not None and float(chunk.min_token_confidence) < 0.06:
             return False
-        if chunk.low_conf_token_ratio is not None and float(chunk.low_conf_token_ratio) > 0.45:
+        if chunk.low_conf_token_ratio is not None and float(chunk.low_conf_token_ratio) > 0.70:
             return False
-        if float(chunk.self_repeat_score) > 0.40:
+        if float(chunk.self_repeat_score) > 0.60:
             return False
-        if float(chunk.scores.get("vocal_presence", 0.0)) < 0.42:
-            return False
-        if self._chunk_quality(chunk) < self.min_chunk_quality:
+        if float(chunk.scores.get("vocal_presence", 0.0)) < 0.28:
             return False
         return True
 
@@ -250,7 +229,6 @@ class OffsetAligner:
             chunk_text = LyricLineStamp.normalize_lyric_text(chunk.text)
             if not chunk_text:
                 continue
-            chunk_quality = self._chunk_quality(chunk)
             for line_index, line in enumerate(lyric_lines):
                 lyric_text = self._line_match_text(line)
                 if not lyric_text:
@@ -263,7 +241,7 @@ class OffsetAligner:
                 if prefix_similarity < self.min_prefix_similarity or full_similarity < self.min_full_similarity:
                     continue
                 anchor_time = self._anchor_time(chunk)
-                score = 1.25 * prefix_similarity + 0.95 * full_similarity + 0.22 * chunk_quality
+                score = 1.30 * prefix_similarity + 1.00 * full_similarity
                 candidates.append(
                     OffsetAnchor(
                         line_index=line_index,
@@ -275,7 +253,7 @@ class OffsetAligner:
                         delta=float(anchor_time - line.timestamp),
                         prefix_similarity=prefix_similarity,
                         full_similarity=full_similarity,
-                        chunk_quality=chunk_quality,
+                        chunk_confidence=chunk.avg_confidence,
                         score=score,
                         chunk_text=chunk.text,
                     )
@@ -353,7 +331,7 @@ class OffsetAligner:
                     "mad": mad,
                     "line_start": line_indices[0],
                     "line_end": line_indices[-1],
-                    "confidence": self._mean([item.chunk_quality for item in cluster]),
+                    "confidence": self._mean([item.chunk_confidence for item in cluster]),
                 }
             )
             reliable_anchors.extend(cluster)
@@ -380,7 +358,68 @@ class OffsetAligner:
             start = end + 1
         return offsets
 
-    def align(self, lyric: LyricLineStamp, transcription: WhisperTrackResult | dict) -> LyricAlignmentResult:
+    @staticmethod
+    def _build_items_from_line_offsets(
+        lyric_lines: list[LyricTokenLine],
+        line_offsets: list[float | None],
+        reliable_anchors: list[OffsetAnchor],
+    ) -> list[AlignedLyricLine]:
+        anchor_by_line = {anchor.line_index: anchor for anchor in reliable_anchors}
+        items: list[AlignedLyricLine] = []
+        for idx, line in enumerate(lyric_lines):
+            offset = line_offsets[idx]
+            start = None if offset is None else float(max(0.0, line.timestamp + offset))
+            end = None
+            if start is not None and idx + 1 < len(lyric_lines) and line_offsets[idx + 1] is not None:
+                end = float(max(start, lyric_lines[idx + 1].timestamp + float(line_offsets[idx + 1])))
+            anchor = anchor_by_line.get(idx)
+            items.append(
+                AlignedLyricLine(
+                    line_index=idx,
+                    line=line,
+                    normalized_text=line.normalized_text,
+                    chunk_indices=[] if anchor is None else [anchor.segment_index],
+                    chunk_text=None if anchor is None else anchor.chunk_text,
+                    start=start,
+                    end=end,
+                    similarity=0.0 if anchor is None else anchor.full_similarity,
+                    score=0.0 if anchor is None else anchor.score,
+                    confidence=None if anchor is None else anchor.chunk_confidence,
+                    hallucination_risk=None,
+                )
+            )
+        return items
+
+    @staticmethod
+    def _build_original_lyric_items(lyric_lines: list[LyricTokenLine]) -> list[AlignedLyricLine]:
+        items: list[AlignedLyricLine] = []
+        for idx, line in enumerate(lyric_lines):
+            start = float(max(0.0, line.timestamp))
+            end = None if idx + 1 >= len(lyric_lines) else float(max(start, lyric_lines[idx + 1].timestamp))
+            items.append(
+                AlignedLyricLine(
+                    line_index=idx,
+                    line=line,
+                    normalized_text=line.normalized_text,
+                    chunk_indices=[],
+                    chunk_text=None,
+                    start=start,
+                    end=end,
+                    similarity=0.0,
+                    score=0.0,
+                    confidence=None,
+                    hallucination_risk=None,
+                )
+            )
+        return items
+
+    def align(
+        self,
+        lyric: LyricLineStamp,
+        transcription: WhisperTrackResult | dict,
+        force_global_fallback: bool = False,
+        fallback_to_original_on_no_anchor: bool = False,
+    ) -> LyricAlignmentResult:
         music_path, chunks = self._coerce_chunks(transcription)
         lyric_lines = lyric.lyric_lines
         if not lyric_lines:
@@ -410,37 +449,10 @@ class OffsetAligner:
                     "mad": mad,
                     "line_start": line_indices[0],
                     "line_end": line_indices[-1],
-                    "confidence": self._mean([item.chunk_quality for item in global_cluster]),
+                    "confidence": self._mean([item.chunk_confidence for item in global_cluster]),
                 }]
                 reliable_anchors = global_cluster
                 is_reliable = True
-
-        line_offsets = self._assign_line_offsets(len(lyric_lines), section_estimates) if is_reliable else [None] * len(lyric_lines)
-        anchor_by_line = {anchor.line_index: anchor for anchor in reliable_anchors}
-
-        items: list[AlignedLyricLine] = []
-        for idx, line in enumerate(lyric_lines):
-            offset = line_offsets[idx]
-            start = None if offset is None else float(max(0.0, line.timestamp + offset))
-            end = None
-            if start is not None and idx + 1 < len(lyric_lines) and line_offsets[idx + 1] is not None:
-                end = float(max(start, lyric_lines[idx + 1].timestamp + float(line_offsets[idx + 1])))
-            anchor = anchor_by_line.get(idx)
-            items.append(
-                AlignedLyricLine(
-                    line_index=idx,
-                    line=line,
-                    normalized_text=line.normalized_text,
-                    chunk_indices=[] if anchor is None else [anchor.segment_index],
-                    chunk_text=None if anchor is None else anchor.chunk_text,
-                    start=start,
-                    end=end,
-                    similarity=0.0 if anchor is None else anchor.full_similarity,
-                    score=0.0 if anchor is None else anchor.score,
-                    confidence=None if anchor is None else anchor.chunk_quality,
-                    hallucination_risk=None,
-                )
-            )
 
         details = {
             "is_reliable": is_reliable,
@@ -452,6 +464,49 @@ class OffsetAligner:
             "sections": section_estimates,
             "anchors": [anchor.to_dict() for anchor in reliable_anchors],
         }
+
+        if not is_reliable and force_global_fallback:
+            if anchors:
+                deltas = [item.delta for item in anchors]
+                offset = self._median(deltas)
+                mad = self._median([abs(delta - offset) for delta in deltas])
+                section_estimates = [{
+                    "section_index": "forced_global",
+                    "source_section_indices": [item["merged_section_index"] for item in merged_sections],
+                    "offset": offset,
+                    "anchor_count": len(anchors),
+                    "mad": mad,
+                    "line_start": 0,
+                    "line_end": len(lyric_lines) - 1,
+                    "confidence": self._mean([item.chunk_confidence for item in anchors]),
+                }]
+                reliable_anchors = anchors
+                line_offsets = self._assign_line_offsets(len(lyric_lines), section_estimates)
+                details["forced_global_fallback"] = True
+                details["fallback_reason"] = "insufficient_or_inconsistent_anchors"
+                details["sections"] = section_estimates
+                details["anchors"] = [anchor.to_dict() for anchor in reliable_anchors]
+                items = self._build_items_from_line_offsets(lyric_lines, line_offsets, reliable_anchors)
+                return LyricAlignmentResult(
+                    music_path=music_path,
+                    items=items,
+                    strategy="offset",
+                    details=details,
+                )
+
+            if fallback_to_original_on_no_anchor:
+                details["fallback_to_original_lyric"] = True
+                details["fallback_reason"] = "no_anchor"
+                items = self._build_original_lyric_items(lyric_lines)
+                return LyricAlignmentResult(
+                    music_path=music_path,
+                    items=items,
+                    strategy="offset",
+                    details=details,
+                )
+
+        line_offsets = self._assign_line_offsets(len(lyric_lines), section_estimates) if is_reliable else [None] * len(lyric_lines)
+        items = self._build_items_from_line_offsets(lyric_lines, line_offsets, reliable_anchors)
         return LyricAlignmentResult(
             music_path=music_path,
             items=items,

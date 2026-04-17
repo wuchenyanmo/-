@@ -75,6 +75,9 @@ def read_audio_metadata(audio_path: str | Path) -> AudioMetadata:
         artist = _first_text(tags.get("artist")) or _first_text(tags.get("albumartist"))
         album = _first_text(tags.get("album"))
 
+    if not title:
+        title = path.stem
+
     return AudioMetadata(
         path=path,
         title=title,
@@ -108,18 +111,31 @@ def search_lyric_from_metadata(
     if not candidates:
         raise RuntimeError("歌词搜索没有返回任何候选结果")
 
-    best = candidates[0]
-    best_score = float(best.get("match sore", 0.0))
-    if best_score < min_search_score:
+    qualified_candidates = [
+        candidate
+        for candidate in candidates
+        if float(candidate.get("match sore", 0.0)) >= min_search_score
+    ]
+    if not qualified_candidates:
+        best_score = float(candidates[0].get("match sore", 0.0))
         raise RuntimeError(
             f"搜索命中分数过低: {best_score:.1f} < {min_search_score:.1f}，"
             "请改用 --song-id 或手动提供 --lyric-path"
         )
 
-    lyric = get_163_lyric(best["id"])
-    if lyric is None:
-        raise RuntimeError(f"已找到歌曲 id={best['id']}，但未能获取歌词")
-    return lyric, best
+    attempted: list[str] = []
+    for candidate in qualified_candidates:
+        song_id_value = candidate.get("id")
+        score = float(candidate.get("match sore", 0.0))
+        attempted.append(f"{song_id_value}({score:.1f})")
+        lyric = get_163_lyric(song_id_value)
+        if lyric is not None:
+            return lyric, candidate
+
+    raise RuntimeError(
+        "已尝试所有分数达标的搜索候选，但都未能获取歌词；"
+        f"尝试过的候选: {', '.join(attempted)}"
+    )
 
 
 def _format_lrc_timestamp(seconds: float) -> str:
@@ -420,6 +436,11 @@ def main(argv: list[str] | None = None) -> None:
         print(f"  sections={len(analysis_result.sections)}")
         print(f"  segments={len(analysis_result.segments)}")
 
+        if not analysis_result.is_vocal:
+            print("警告:")
+            print("  当前音频未检测到明显人声，已跳过转写、对齐、歌词写回与歌词文件输出")
+            return
+
         analyzer.release_model_if_needed()
 
         if args.align_mode in {"auto", "offset-only"}:
@@ -466,7 +487,31 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"已保存 Offset 调试 JSON: {args.offset_debug_json}")
 
             if args.align_mode == "offset-only" and not _offset_result_is_reliable(alignment_result):
-                raise RuntimeError("offset-only 模式未能获得足够一致的 anchor，请改用 auto 或 dp 模式")
+                print("警告:")
+                print("  offset-only 模式的 anchor 数量不足或一致性不足，继续忽略可靠性阈值计算全局 offset")
+                alignment_result = offset_aligner.align(
+                    lyric=lyric,
+                    transcription=track_result,
+                    force_global_fallback=True,
+                    fallback_to_original_on_no_anchor=True,
+                )
+                offset_alignment_result = alignment_result
+                print("Offset 强制回退:")
+                print(f"  stats={alignment_result.stats}")
+                _print_offset_alignment_summary(alignment_result)
+
+                if args.offset_debug_json:
+                    save_offset_debug_json(
+                        Path(args.offset_debug_json).expanduser().resolve(),
+                        analysis_result.to_dict(),
+                        lyric=lyric,
+                        track_result=offset_track_result,
+                        alignment_result=offset_alignment_result,
+                        selected_segment_indices=offset_segment_indices,
+                        mode=args.align_mode,
+                        fallback_to="forced-global-or-original",
+                    )
+                    print(f"已更新 Offset 调试 JSON: {args.offset_debug_json}")
 
         if args.align_mode == "dp" or (args.align_mode == "auto" and not _offset_result_is_reliable(alignment_result)):
             if args.align_mode == "auto":
