@@ -1,8 +1,8 @@
-from LyricPlus.Align import AlignedLyricLine, LyricAlignmentResult, LyricAligner
-from LyricPlus.Lyric import LyricLineStamp, LyricTokenLine
-from LyricPlus.OffsetAlign import OffsetAligner
-from LyricPlus.Transcribe import WhisperChunkResult, WhisperTrackResult, WhisperTranscriber
-from LyricPlus.Vocal import VocalAnalysisResult, VocalAnalyzer, VocalSection, VocalSegment
+from Lazulite.Align import AlignedLyricLine, LyricAlignmentResult, LyricAligner
+from Lazulite.Lyric import LyricLineStamp, LyricTokenLine
+from Lazulite.OffsetAlign import OffsetAligner
+from Lazulite.Transcribe import WhisperChunkResult, WhisperTrackResult, WhisperTranscriber
+from Lazulite.Vocal import VocalAnalysisResult, VocalAnalyzer, VocalSection, VocalSegment
 
 __all__ = [
     "AlignedLyricLine",
