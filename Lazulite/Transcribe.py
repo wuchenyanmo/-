@@ -1,6 +1,7 @@
 import gzip
 from difflib import SequenceMatcher
 from collections.abc import Iterable
+import warnings
 
 import librosa
 import numpy as np
@@ -288,6 +289,7 @@ class WhisperTranscriber:
 
         self.model = None
         self.processor = None
+        self.attn_implementation = None
 
     def load_model(self):
         """
@@ -304,9 +306,22 @@ class WhisperTranscriber:
             "use_safetensors": True,
         }
         if self.device.startswith("cuda"):
-            model_kwargs["attn_implementation"] = "flash_attention_2"
+            flash_kwargs = dict(model_kwargs)
+            flash_kwargs["attn_implementation"] = "flash_attention_2"
+            try:
+                self.model = AutoModelForSpeechSeq2Seq.from_pretrained(self.model_id, **flash_kwargs)
+                self.attn_implementation = "flash_attention_2"
+            except Exception as exc:
+                warnings.warn(
+                    "flash_attention_2 不可用，已回退到默认注意力实现。"
+                    f" 原始错误: {exc}",
+                    RuntimeWarning,
+                )
 
-        self.model = AutoModelForSpeechSeq2Seq.from_pretrained(self.model_id, **model_kwargs)
+        if self.model is None:
+            self.model = AutoModelForSpeechSeq2Seq.from_pretrained(self.model_id, **model_kwargs)
+            self.attn_implementation = "default"
+
         self.model.to(self.device)
         self.model.eval()
         self.processor = AutoProcessor.from_pretrained(self.model_id)
