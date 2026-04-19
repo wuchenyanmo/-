@@ -190,11 +190,77 @@ def _estimate_average_alignment_offset(alignment_result) -> float:
     offsets = [
         float(item.start - item.line.timestamp)
         for item in alignment_result.items
-        if item.start is not None
+        if item.start is not None and item.line.timestamp is not None
     ]
     if not offsets:
         return 0.0
     return sum(offsets) / len(offsets)
+
+
+def _estimate_plain_text_step(alignment_result) -> float | None:
+    points = [
+        (item.line_index, float(item.start))
+        for item in alignment_result.items
+        if item.start is not None
+    ]
+    if len(points) < 2:
+        return None
+    steps = []
+    for idx in range(1, len(points)):
+        prev_index, prev_time = points[idx - 1]
+        current_index, current_time = points[idx]
+        line_gap = current_index - prev_index
+        if line_gap <= 0:
+            continue
+        time_gap = current_time - prev_time
+        if time_gap <= 0:
+            continue
+        steps.append(time_gap / line_gap)
+    if not steps:
+        return None
+    steps.sort()
+    return float(steps[len(steps) // 2])
+
+
+def _fill_plain_text_unmatched_timestamps(alignment_result) -> list[float | None]:
+    filled = [
+        None if item.start is None else float(item.start)
+        for item in alignment_result.items
+    ]
+    known_indices = [idx for idx, value in enumerate(filled) if value is not None]
+    if not known_indices:
+        return filled
+
+    default_step = _estimate_plain_text_step(alignment_result) or 2.0
+
+    first_idx = known_indices[0]
+    for idx in range(first_idx - 1, -1, -1):
+        next_time = filled[idx + 1]
+        if next_time is None:
+            continue
+        filled[idx] = max(0.0, float(next_time - default_step))
+
+    last_idx = known_indices[-1]
+    for idx in range(last_idx + 1, len(filled)):
+        prev_time = filled[idx - 1]
+        if prev_time is None:
+            continue
+        filled[idx] = float(prev_time + default_step)
+
+    for start_idx, end_idx in zip(known_indices, known_indices[1:]):
+        left_time = filled[start_idx]
+        right_time = filled[end_idx]
+        if left_time is None or right_time is None:
+            continue
+        gap = end_idx - start_idx
+        if gap <= 1:
+            continue
+        step = (right_time - left_time) / gap
+        if step <= 0:
+            step = default_step
+        for idx in range(start_idx + 1, end_idx):
+            filled[idx] = float(left_time + step * (idx - start_idx))
+    return filled
 
 
 def build_aligned_lrc(
@@ -206,16 +272,20 @@ def build_aligned_lrc(
     skip_unmatched: bool = False,
 ) -> str:
     lines: list[str] = []
-    average_offset = _estimate_average_alignment_offset(alignment_result)
+    has_real_timestamps = getattr(lyric, "has_real_timestamps", True)
+    average_offset = _estimate_average_alignment_offset(alignment_result) if has_real_timestamps else None
+    plain_text_fallback_times = _fill_plain_text_unmatched_timestamps(alignment_result) if not has_real_timestamps else None
 
     for key in lyric.metadata_keys:
         value = lyric.metadata[key]
         lines.append(f"[{key}:{value}]")
 
-    for item in alignment_result.items:
+    for idx, item in enumerate(alignment_result.items):
         timestamp = item.start
-        if timestamp is None and prefer_original_on_unmatched:
-            timestamp = max(0.0, float(item.line.timestamp + average_offset))
+        if timestamp is None and has_real_timestamps and prefer_original_on_unmatched and item.line.timestamp is not None:
+            timestamp = max(0.0, float(item.line.timestamp + float(average_offset or 0.0)))
+        if timestamp is None and not has_real_timestamps and plain_text_fallback_times is not None:
+            timestamp = plain_text_fallback_times[idx]
         if timestamp is None:
             if skip_unmatched:
                 continue
@@ -495,7 +565,12 @@ def main(argv: list[str] | None = None) -> None:
 
         analyzer.release_model_if_needed()
 
-        if args.align_mode in {"auto", "offset-only"}:
+        lyric_has_real_timestamps = getattr(lyric, "has_real_timestamps", True)
+
+        if args.align_mode == "offset-only" and not lyric_has_real_timestamps:
+            raise RuntimeError("offset-only 模式要求输入歌词包含真实时间戳；当前歌词为纯文本，请改用 auto 或 dp")
+
+        if args.align_mode in {"auto", "offset-only"} and lyric_has_real_timestamps:
             offset_segment_indices = select_offset_segment_indices(analysis_result)
             print("Offset 预筛选:")
             print(f"  candidate_segments={len(offset_segment_indices)}")
@@ -565,10 +640,13 @@ def main(argv: list[str] | None = None) -> None:
                     )
                     print(f"已更新 Offset 调试 JSON: {args.offset_debug_json}")
 
-        if args.align_mode == "dp" or (args.align_mode == "auto" and not _offset_result_is_reliable(alignment_result)):
+        if args.align_mode == "dp" or (args.align_mode == "auto" and (not lyric_has_real_timestamps or not _offset_result_is_reliable(alignment_result))):
             if args.align_mode == "auto":
                 print("Offset 回退:")
-                print("  reason=anchor 不足或 section 偏移一致性不足，切换到 token 时间戳 + 动态规划")
+                if not lyric_has_real_timestamps:
+                    print("  reason=歌词不包含真实时间戳，跳过 offset，切换到 token 时间戳 + 动态规划")
+                else:
+                    print("  reason=anchor 不足或 section 偏移一致性不足，切换到 token 时间戳 + 动态规划")
                 offset_fallback_to = "dp"
 
                 if args.offset_debug_json and offset_track_result is not None and offset_alignment_result is not None:
