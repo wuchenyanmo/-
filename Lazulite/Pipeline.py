@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import io
+import sys
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from Lazulite.Debug import (
     save_transcription_json,
 )
 from Lazulite.Lyric import LyricLineStamp, LyricTokenLine
+from Lazulite.Search.Common import build_search_text_variants
 from Lazulite.Search import NeteaseProvider, build_default_provider_registry
 
 
@@ -118,13 +120,53 @@ def search_lyric_from_metadata(
     top_candidate_by_source: dict[str, dict[str, Any]] = {}
     attempted_by_source: dict[str, list[str]] = {}
     providers = build_default_provider_registry()
+    title_variants = build_search_text_variants(metadata.title)
+    artist_variants = build_search_text_variants(metadata.artist)
+    album_variants = build_search_text_variants(metadata.album)
+    if not artist_variants:
+        artist_variants = [metadata.artist or ""]
+    if not album_variants:
+        album_variants = [metadata.album or ""]
 
     for provider in providers:
-        candidates = provider.search(
-            title=metadata.title,
-            duration=metadata.duration,
-            artist=metadata.artist,
-            album=metadata.album,
+        deduped_candidates: dict[str, Any] = {}
+        for title_variant in title_variants:
+            query_artist = artist_variants[0] or None
+            query_album = album_variants[0] or None
+            query_pairs = [
+                (title_variant, query_artist, query_album),
+            ]
+            if query_album:
+                query_pairs.append((title_variant, query_artist, None))
+            simplified_artist = artist_variants[-1] or None
+            simplified_album = album_variants[-1] or None
+            fallback_pair = (title_variant, simplified_artist, simplified_album)
+            if fallback_pair not in query_pairs:
+                query_pairs.append(fallback_pair)
+            if simplified_album:
+                fallback_no_album = (title_variant, simplified_artist, None)
+                if fallback_no_album not in query_pairs:
+                    query_pairs.append(fallback_no_album)
+
+            for query_title, query_artist_value, query_album_value in query_pairs:
+                if not query_title:
+                    continue
+                candidates = provider.search(
+                    title=query_title,
+                    duration=metadata.duration,
+                    artist=query_artist_value,
+                    album=query_album_value,
+                )
+                for candidate in candidates:
+                    key = f"{candidate.source}:{candidate.candidate_id}"
+                    existing = deduped_candidates.get(key)
+                    if existing is None or float(candidate.match_score) > float(existing.match_score):
+                        deduped_candidates[key] = candidate
+
+        candidates = sorted(
+            deduped_candidates.values(),
+            key=lambda item: float(item.match_score),
+            reverse=True,
         )
         if not candidates:
             attempted_by_source[provider.source_name] = []
@@ -145,6 +187,13 @@ def search_lyric_from_metadata(
             except Exception as exc:
                 warnings.warn(
                     f"在线歌词候选获取失败，已跳过 source={provider.source_name} candidate={candidate.candidate_id}: {exc}",
+                    RuntimeWarning,
+                )
+                lyric = None
+            if lyric is not None and not getattr(lyric, "lyric_lines", []):
+                warnings.warn(
+                    "在线歌词候选返回空歌词，已跳过 "
+                    f"source={provider.source_name} candidate={candidate.candidate_id}",
                     RuntimeWarning,
                 )
                 lyric = None
@@ -473,6 +522,21 @@ def _batch_log_paths(directory: Path) -> tuple[Path, Path]:
     return directory / "lazulite_batch.log", directory / "lazulite_batch.err"
 
 
+class _TeeStream:
+    def __init__(self, mirror, buffer: io.StringIO):
+        self._mirror = mirror
+        self._buffer = buffer
+
+    def write(self, data):
+        self._mirror.write(data)
+        self._buffer.write(data)
+        return len(data)
+
+    def flush(self):
+        self._mirror.flush()
+        self._buffer.flush()
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="读取音频元数据，搜索歌词，执行分片转写与约束对齐，并将对齐歌词写回音频标签。"
@@ -780,8 +844,11 @@ def _run_batch_directory(args: argparse.Namespace, input_dir: Path) -> None:
         per_file_args.audio_path = str(audio_file)
         output = io.StringIO()
         error_output = io.StringIO()
+        tee_stdout = _TeeStream(sys.stdout, output)
+        tee_stderr = _TeeStream(sys.stderr, error_output)
         try:
-            with redirect_stdout(output), redirect_stderr(error_output):
+            print(f"\n=== {audio_file.name} ===")
+            with redirect_stdout(tee_stdout), redirect_stderr(tee_stderr):
                 process_audio_file(per_file_args, audio_file)
         except Exception:
             failure_count += 1

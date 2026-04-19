@@ -7,9 +7,9 @@ from Lazulite.Search.Provider import OnlineLyricProvider, SearchCandidate
 
 def build_default_provider_registry() -> list[OnlineLyricProvider]:
     return [
-        NeteaseProvider(),
         KugouProvider(),
         QQMusicProvider(),
+        NeteaseProvider(),
         LRCLIBProvider(),
     ]
 
