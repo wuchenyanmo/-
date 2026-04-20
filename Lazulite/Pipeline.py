@@ -210,6 +210,7 @@ def search_lyric_from_metadata(
         )
     )
 
+    plain_text_fallback: tuple[LyricLineStamp, dict[str, Any]] | None = None
     for candidate in qualified_candidates_all:
         attempted_by_source.setdefault(candidate.source, []).append(
             f"{candidate.candidate_id}({candidate.match_score:.1f})"
@@ -231,7 +232,14 @@ def search_lyric_from_metadata(
             )
             lyric = None
         if lyric is not None:
-            return lyric, candidate.to_dict()
+            candidate_info = candidate.to_dict()
+            if getattr(lyric, "has_real_timestamps", True):
+                return lyric, candidate_info
+            if plain_text_fallback is None:
+                plain_text_fallback = (lyric, candidate_info)
+
+    if plain_text_fallback is not None:
+        return plain_text_fallback
 
     if best_score_by_source:
         summary = ", ".join(
