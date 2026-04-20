@@ -120,6 +120,10 @@ def search_lyric_from_metadata(
     top_candidate_by_source: dict[str, dict[str, Any]] = {}
     attempted_by_source: dict[str, list[str]] = {}
     providers = build_default_provider_registry()
+    provider_by_source = {
+        provider.source_name: provider
+        for provider in providers
+    }
     title_variants = build_search_text_variants(metadata.title)
     artist_variants = build_search_text_variants(metadata.artist)
     album_variants = build_search_text_variants(metadata.album)
@@ -127,6 +131,8 @@ def search_lyric_from_metadata(
         artist_variants = [metadata.artist or ""]
     if not album_variants:
         album_variants = [metadata.album or ""]
+
+    qualified_candidates_all: list[Any] = []
 
     for provider in providers:
         deduped_candidates: dict[str, Any] = {}
@@ -179,27 +185,42 @@ def search_lyric_from_metadata(
             for candidate in candidates
             if float(candidate.match_score) >= min_search_score
         ]
-        attempted: list[str] = []
-        for candidate in qualified_candidates:
-            attempted.append(f"{candidate.candidate_id}({candidate.match_score:.1f})")
-            try:
-                lyric = provider.fetch_lyric(candidate)
-            except Exception as exc:
-                warnings.warn(
-                    f"在线歌词候选获取失败，已跳过 source={provider.source_name} candidate={candidate.candidate_id}: {exc}",
-                    RuntimeWarning,
-                )
-                lyric = None
-            if lyric is not None and not getattr(lyric, "lyric_lines", []):
-                warnings.warn(
-                    "在线歌词候选返回空歌词，已跳过 "
-                    f"source={provider.source_name} candidate={candidate.candidate_id}",
-                    RuntimeWarning,
-                )
-                lyric = None
-            if lyric is not None:
-                return lyric, candidate.to_dict()
-        attempted_by_source[provider.source_name] = attempted
+        attempted_by_source[provider.source_name] = []
+        qualified_candidates_all.extend(qualified_candidates)
+
+    provider_order = {
+        provider.source_name: index
+        for index, provider in enumerate(providers)
+    }
+    qualified_candidates_all.sort(
+        key=lambda candidate: (
+            -float(candidate.match_score),
+            provider_order.get(candidate.source, len(provider_order)),
+        )
+    )
+
+    for candidate in qualified_candidates_all:
+        attempted_by_source.setdefault(candidate.source, []).append(
+            f"{candidate.candidate_id}({candidate.match_score:.1f})"
+        )
+        provider = provider_by_source[candidate.source]
+        try:
+            lyric = provider.fetch_lyric(candidate)
+        except Exception as exc:
+            warnings.warn(
+                f"在线歌词候选获取失败，已跳过 source={provider.source_name} candidate={candidate.candidate_id}: {exc}",
+                RuntimeWarning,
+            )
+            lyric = None
+        if lyric is not None and not getattr(lyric, "lyric_lines", []):
+            warnings.warn(
+                "在线歌词候选返回空歌词，已跳过 "
+                f"source={provider.source_name} candidate={candidate.candidate_id}",
+                RuntimeWarning,
+            )
+            lyric = None
+        if lyric is not None:
+            return lyric, candidate.to_dict()
 
     if best_score_by_source:
         summary = ", ".join(
