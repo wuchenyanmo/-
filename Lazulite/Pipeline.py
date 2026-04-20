@@ -100,12 +100,21 @@ def search_lyric_from_metadata(
     netease_song_id: str | int | None = None,
     min_search_score: float = 55.0,
     search_workers: int = 4,
+    min_lyric_lines: int = 3,
 ) -> tuple[LyricLineStamp, dict[str, Any]]:
+    def _is_effectively_empty_lyric(lyric: LyricLineStamp | None) -> bool:
+        if lyric is None:
+            return True
+        return len(getattr(lyric, "lyric_lines", [])) <= int(min_lyric_lines)
+
     if netease_song_id is not None:
         provider = NeteaseProvider()
         lyric = provider.fetch_lyric_by_song_id(netease_song_id)
-        if lyric is None:
-            raise RuntimeError(f"未能获取 netease_song_id={netease_song_id} 对应歌词")
+        if _is_effectively_empty_lyric(lyric):
+            raise RuntimeError(
+                f"未能获取 netease_song_id={netease_song_id} 对应的有效歌词；"
+                f"歌词行数需大于 {int(min_lyric_lines)}"
+            )
         return lyric, {
             "source": provider.source_name,
             "candidate_id": str(netease_song_id),
@@ -250,10 +259,11 @@ def search_lyric_from_metadata(
                     RuntimeWarning,
                 )
                 lyric = None
-            if lyric is not None and not getattr(lyric, "lyric_lines", []):
+            if _is_effectively_empty_lyric(lyric):
                 warnings.warn(
-                    "在线歌词候选返回空歌词，已跳过 "
-                    f"source={provider.source_name} candidate={candidate.candidate_id}",
+                    "在线歌词候选返回空歌词或歌词行数过少，已跳过 "
+                    f"source={provider.source_name} candidate={candidate.candidate_id} "
+                    f"(min_lyric_lines={int(min_lyric_lines)})",
                     RuntimeWarning,
                 )
                 lyric = None
@@ -659,6 +669,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-mode", default="hybrid", choices=["none", "previous", "hint", "hybrid"])
     parser.add_argument("--num-candidates", type=int, default=1, help="每个分片重复转写次数")
     parser.add_argument("--min-search-score", type=float, default=55.0, help="歌词搜索最低接受分数")
+    parser.add_argument("--min-lyric-lines", type=int, default=3, help="在线歌词最少有效行数；小于等于该值会视为空歌词")
     parser.add_argument("--search-workers", type=int, default=4, help="在线歌词 provider 搜索并发数")
     parser.add_argument("--output-lrc", help="将最终对齐歌词额外保存为 .lrc 文件")
     parser.add_argument("--transcription-json", help="将分片转写结果额外保存为 JSON")
@@ -710,6 +721,7 @@ def _resolve_lyric_source(
         netease_song_id=args.netease_song_id,
         min_search_score=args.min_search_score,
         search_workers=args.search_workers,
+        min_lyric_lines=args.min_lyric_lines,
     )
 
 
