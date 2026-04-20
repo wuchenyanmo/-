@@ -597,8 +597,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--align-mode",
         default="auto",
-        choices=["auto", "offset-only", "dp"],
-        help="对齐模式：auto 先尝试轻量 offset，不足时回退到 token+DP；offset-only 仅做偏移估计；dp 始终走 token 时间戳 + 动态规划",
+        choices=["auto", "offset-only", "hybrid", "dp-only"],
+        help="对齐模式：auto： offset优先，不足时回退到 hybrid，缺少源时间戳时使用 dp-only；offset-only 仅做偏移估计；hybrid 动态规划对齐后再估计全局/分段偏移；dp-only 仅通过源歌词顺序单调动态规划对齐",
     )
     parser.add_argument("--prompt-mode", default="hybrid", choices=["none", "previous", "hint", "hybrid"])
     parser.add_argument("--num-candidates", type=int, default=1, help="每个分片重复转写次数")
@@ -728,7 +728,7 @@ def process_audio_file(args: argparse.Namespace, audio_path: str | Path) -> None
         lyric_has_real_timestamps = getattr(lyric, "has_real_timestamps", True)
 
         if args.align_mode == "offset-only" and not lyric_has_real_timestamps:
-            raise RuntimeError("offset-only 模式要求输入歌词包含真实时间戳；当前歌词为纯文本，请改用 auto 或 dp")
+            raise RuntimeError("offset-only 模式要求输入歌词包含真实时间戳；当前歌词为纯文本，请改用 auto、hybrid 或 dp-only")
 
         if args.align_mode in {"auto", "offset-only"} and lyric_has_real_timestamps:
             offset_segment_indices = select_offset_segment_indices(analysis_result)
@@ -800,7 +800,10 @@ def process_audio_file(args: argparse.Namespace, audio_path: str | Path) -> None
                     )
                     print(f"已更新 Offset 调试 JSON: {args.offset_debug_json}")
 
-        if args.align_mode == "dp" or (args.align_mode == "auto" and (not lyric_has_real_timestamps or not _offset_result_is_reliable(alignment_result))):
+        if args.align_mode in {"hybrid", "dp-only"} or (
+            args.align_mode == "auto"
+            and (not lyric_has_real_timestamps or not _offset_result_is_reliable(alignment_result))
+        ):
             if args.align_mode == "auto":
                 print("Offset 回退:")
                 if not lyric_has_real_timestamps:
@@ -845,7 +848,8 @@ def process_audio_file(args: argparse.Namespace, audio_path: str | Path) -> None
             if args.align_mode == "auto":
                 alignment_result.details = dict(alignment_result.details)
                 alignment_result.details["fallback_from"] = "offset"
-            if lyric_has_real_timestamps:
+            enable_hybrid_refine = lyric_has_real_timestamps and args.align_mode != "dp-only"
+            if enable_hybrid_refine:
                 alignment_result = aligner.refine_with_lyric_timestamps(
                     lyric=lyric,
                     alignment_result=alignment_result,
@@ -853,6 +857,8 @@ def process_audio_file(args: argparse.Namespace, audio_path: str | Path) -> None
                 )
             print("歌词对齐:")
             print(f"  stats={alignment_result.stats}")
+            if args.align_mode == "dp-only":
+                print("  hybrid_refinement=False")
             hybrid_details = (alignment_result.details or {}).get("hybrid_refinement") or {}
             if hybrid_details.get("enabled"):
                 print("  hybrid_refinement=True")
