@@ -5,6 +5,7 @@ import copy
 import io
 import sys
 import traceback
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
@@ -610,6 +611,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return build_arg_parser().parse_args(argv)
 
 
+def _resolve_lyric_source(
+    args: argparse.Namespace,
+    audio_path: Path,
+    metadata: AudioMetadata,
+) -> tuple[LyricLineStamp, dict[str, Any]]:
+    if args.lyric_path or args.read_metadata_lyric:
+        lyric = load_alignment_lyric(args.lyric_path, music_path=str(audio_path))
+        if lyric is None and args.lyric_path:
+            raise RuntimeError(f"无法从本地歌词文件加载歌词: {args.lyric_path}")
+        if lyric is not None:
+            return lyric, {
+                "source": "metadata" if args.read_metadata_lyric and not args.lyric_path else "local",
+                "candidate_id": None,
+                "title": metadata.title,
+                "artist": metadata.artist,
+                "album": metadata.album,
+                "match_score": None,
+            }
+
+    return search_lyric_from_metadata(
+        metadata=metadata,
+        netease_song_id=args.netease_song_id,
+        min_search_score=args.min_search_score,
+    )
+
+
 def process_audio_file(args: argparse.Namespace, audio_path: str | Path) -> None:
     audio_path = Path(audio_path).expanduser().resolve()
     if not audio_path.exists():
@@ -630,41 +657,16 @@ def process_audio_file(args: argparse.Namespace, audio_path: str | Path) -> None
     print(f"  album={metadata.album}")
     print(f"  duration={metadata.duration:.2f}s")
 
-    if args.lyric_path or args.read_metadata_lyric:
-        lyric = load_alignment_lyric(args.lyric_path, music_path=str(audio_path))
-        if lyric is None and args.lyric_path:
-            raise RuntimeError(f"无法从本地歌词文件加载歌词: {args.lyric_path}")
-        if lyric is not None:
-            search_result = {
-                "source": "metadata" if args.read_metadata_lyric and not args.lyric_path else "local",
-                "candidate_id": None,
-                "title": metadata.title,
-                "artist": metadata.artist,
-                "album": metadata.album,
-                "match_score": None,
-            }
-        else:
-            lyric, search_result = search_lyric_from_metadata(
-                metadata=metadata,
-                netease_song_id=args.netease_song_id,
-                min_search_score=args.min_search_score,
-            )
-    else:
-        lyric, search_result = search_lyric_from_metadata(
-            metadata=metadata,
-            netease_song_id=args.netease_song_id,
-            min_search_score=args.min_search_score,
-        )
-
-    print("歌词来源:")
-    print(f"  source={search_result.get('source', 'netease')}")
-    print(f"  candidate_id={search_result.get('candidate_id')}")
-    print(f"  match_score={search_result.get('match_score')}")
-    print(f"  lyric_lines={len(lyric.lyric_lines)}")
-
     analyzer = VocalAnalyzer(low_memory_mode=args.low_memory_mode)
     aligner = LyricAligner()
     offset_aligner = OffsetAligner()
+    lyric_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lyric-search")
+    lyric_future: Future[tuple[LyricLineStamp, dict[str, Any]]] = lyric_executor.submit(
+        _resolve_lyric_source,
+        args,
+        audio_path,
+        metadata,
+    )
     offset_transcriber = None
     dp_transcriber = None
     track_result = None
@@ -673,6 +675,8 @@ def process_audio_file(args: argparse.Namespace, audio_path: str | Path) -> None
     offset_alignment_result = None
     offset_segment_indices: set[int] = set()
     offset_fallback_to = None
+    lyric: LyricLineStamp | None = None
+    search_result: dict[str, Any] | None = None
 
     try:
         analysis_result = analyzer.analyze_file(str(audio_path))
@@ -688,6 +692,18 @@ def process_audio_file(args: argparse.Namespace, audio_path: str | Path) -> None
             return
 
         analyzer.release_model_if_needed()
+
+        lyric, search_result = lyric_future.result()
+        print("歌词来源:")
+        print(f"  source={search_result.get('source', 'netease')}")
+        print(f"  candidate_id={search_result.get('candidate_id')}")
+        print(f"  title={search_result.get('title')}")
+        print(f"  artist={search_result.get('artist')}")
+        print(f"  album={search_result.get('album')}")
+        if search_result.get("duration") is not None:
+            print(f"  candidate_duration={float(search_result['duration']):.2f}s")
+        print(f"  match_score={search_result.get('match_score')}")
+        print(f"  lyric_lines={len(lyric.lyric_lines)}")
 
         lyric_has_real_timestamps = getattr(lyric, "has_real_timestamps", True)
 
@@ -845,6 +861,7 @@ def process_audio_file(args: argparse.Namespace, audio_path: str | Path) -> None
             offset_transcriber.unload_model_if_needed()
         if dp_transcriber is not None:
             dp_transcriber.unload_model_if_needed()
+        lyric_executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _run_batch_directory(args: argparse.Namespace, input_dir: Path) -> None:
