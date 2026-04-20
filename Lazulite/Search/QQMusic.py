@@ -11,6 +11,7 @@ from requests.exceptions import RequestException
 from Lazulite.Lyric import LyricLineStamp
 from Lazulite.Search.Common import combined_fuzzy_score
 from Lazulite.Search.Provider import OnlineLyricProvider, SearchCandidate
+from Lazulite.TextNormalize import clean_text, unique_non_empty_texts
 
 QQ_HEADERS = {
     "User-Agent": (
@@ -36,15 +37,14 @@ def _song_album(result: dict) -> dict:
 def _song_aliases(result: dict) -> list[str]:
     aliases: list[str] = []
     for key in ("subtitle", "title"):
-        value = str(result.get(key) or "").strip()
+        value = clean_text(result.get(key))
         if value:
             aliases.append(value)
     return aliases
 
 
 def parse_qq_artist_dict(artist_dict: dict) -> list[str]:
-    artist_list = [str(artist_dict.get("name") or "").strip(), str(artist_dict.get("title") or "").strip()]
-    return [item for item in set(artist_list) if item]
+    return unique_non_empty_texts([artist_dict.get("name"), artist_dict.get("title")])
 
 
 def match_qq_search_result(
@@ -86,12 +86,11 @@ def match_qq_search_result(
         album_weight = 0.0
         score["album"] = 0.0
     else:
-        result_albums = [
-            str(album_info.get("name") or "").strip(),
-            str(album_info.get("title") or "").strip(),
-            str(album_info.get("subtitle") or "").strip(),
-        ]
-        result_albums = [item for item in result_albums if item]
+        result_albums = unique_non_empty_texts([
+            album_info.get("name"),
+            album_info.get("title"),
+            album_info.get("subtitle"),
+        ])
         score["album"] = (
             max(combined_fuzzy_score(album, item, full_match_weight=full_match_weight) for item in result_albums)
             if result_albums else 0.0
