@@ -11,6 +11,7 @@ from urllib3.exceptions import InsecureRequestWarning
 from Lazulite.Lyric import LyricLineStamp
 from Lazulite.Search.Common import combined_fuzzy_score
 from Lazulite.Search.Provider import OnlineLyricProvider, SearchCandidate
+from Lazulite.TextNormalize import KUGOU_ARTIST_SEPARATORS, split_text
 
 KUGOU_HEADERS = {
     "User-Agent": (
@@ -46,12 +47,7 @@ def _safe_json_get(url: str, params: dict, timeout: tuple[int, int] = (5, 7)) ->
 
 
 def _split_kugou_artists(value: str | None) -> list[str]:
-    if not value:
-        return []
-    normalized = str(value)
-    for sep in ("、", " / ", "/", "&", "·", ";", "；", ",", "，"):
-        normalized = normalized.replace(sep, "|")
-    return [item.strip() for item in normalized.split("|") if item.strip()]
+    return split_text(value, KUGOU_ARTIST_SEPARATORS)
 
 
 def _build_kugou_keyword(candidate: SearchCandidate) -> str:

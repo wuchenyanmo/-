@@ -1,12 +1,10 @@
 import re
-import unicodedata
 from collections import Counter
+from Lazulite.TextNormalize import RE_SPACES, normalize_text
 
 # 基础 LRC 解析规则
 RE_METADATA = re.compile(r'^\[([a-zA-Z]+):(.*)\]$')
 RE_LYRICS = re.compile(r'^\[(\d{2,}:\d{2}\.\d{2,3})\](.*)$')
-RE_SPACES = re.compile(r'\s+')
-
 # 匹配日文歌词中常见的汉字(假名)注音，用于规范化时去掉括号内读音
 RE_FURIGANA = re.compile(r'([\u3400-\u4dbf\u4e00-\u9fff々〆ヵヶ]+)\(([\u3040-\u30ffー・ ]+)\)')
 RE_METADATA_SEP = re.compile(r'\s*[:：|｜]\s*')
@@ -241,15 +239,7 @@ class LyricLineStamp:
         返回:
             归一化后的文本。
         """
-        text = unicodedata.normalize('NFKC', text)
-        text = text.replace('’', "'").replace('`', "'")
-        text = text.replace('“', '"').replace('”', '"')
-        text = text.strip()
-        if keep_spaces:
-            text = RE_SPACES.sub(' ', text)
-        else:
-            text = ''.join(text.split())
-        return text
+        return normalize_text(text, keep_spaces=keep_spaces)
 
     @classmethod
     def normalize_lyric_text(cls, text: str) -> str:

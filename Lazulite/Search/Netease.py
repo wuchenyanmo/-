@@ -11,6 +11,7 @@ from requests.exceptions import RequestException
 from Lazulite.Lyric import LyricLineStamp
 from Lazulite.Search.Common import combined_fuzzy_score
 from Lazulite.Search.Provider import OnlineLyricProvider, SearchCandidate
+from Lazulite.TextNormalize import clean_text, unique_non_empty_texts
 
 HEADER = {
     "User-Agent": (
@@ -32,11 +33,11 @@ def parse_163_artist_dict(artist_dict: dict) -> list[str]:
     """
     解析网易云歌手对象，返回去重后的候选名字列表。
     """
-    artist_list = [str(artist_dict.get("name") or "").strip()]
+    artist_list = [clean_text(artist_dict.get("name"))]
     for key in ("tns", "alia", "alias"):
         values = artist_dict.get(key) or []
-        artist_list.extend(str(item).strip() for item in values if str(item).strip())
-    return [item for item in set(artist_list) if item]
+        artist_list.extend(values)
+    return unique_non_empty_texts(artist_list)
 
 
 def _song_artists(result: dict) -> list[dict]:
@@ -57,8 +58,8 @@ def _song_aliases(result: dict) -> list[str]:
     aliases: list[str] = []
     for key in ("alia", "transNames", "tns"):
         values = result.get(key) or []
-        aliases.extend(str(item).strip() for item in values if str(item).strip())
-    return aliases
+        aliases.extend(values)
+    return unique_non_empty_texts(aliases)
 
 
 def match_163_search_result(
@@ -103,8 +104,7 @@ def match_163_search_result(
         album_weight = 0.0
         score["album"] = 0.0
     else:
-        result_albums = [str(album_info.get("name") or "").strip(), *(album_info.get("tns") or [])]
-        result_albums = [str(item).strip() for item in result_albums if str(item).strip()]
+        result_albums = unique_non_empty_texts([album_info.get("name"), *(album_info.get("tns") or [])])
         score["album"] = (
             max(combined_fuzzy_score(album, item, full_match_weight=full_match_weight) for item in result_albums)
             if result_albums else 0.0

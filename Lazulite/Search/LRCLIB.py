@@ -8,8 +8,9 @@ import requests
 from requests.exceptions import RequestException
 
 from Lazulite.Lyric import LyricLineStamp
-from Lazulite.Search.Common import combined_fuzzy_score
+from Lazulite.Search.Common import combined_fuzzy_score, normalize_search_text
 from Lazulite.Search.Provider import OnlineLyricProvider, SearchCandidate
+from Lazulite.TextNormalize import clean_text
 
 LRCLIB_HEADERS = {
     "User-Agent": "LyricPlusScript/0.1 (+https://github.com/)",
@@ -18,7 +19,6 @@ LRCLIB_SEARCH_API = "https://lrclib.net/api/search"
 LRCLIB_GET_BY_ID_API = "https://lrclib.net/api/get/{lyric_id}"
 RE_LRCLIB_METADATA_LINE = re.compile(r"^\[[a-zA-Z]+:.*\]$")
 SEARCH_LIMIT = 20
-RE_HYPHEN_VARIANTS = re.compile(r"[\u2010\u2011\u2012\u2013\u2014\u2212]")
 
 
 def match_lrclib_search_result(
@@ -85,15 +85,6 @@ def _parse_lrclib_lyric(payload: dict) -> LyricLineStamp | None:
     if not cleaned_lines:
         return None
     return LyricLineStamp.from_plain_text("\n".join(cleaned_lines))
-
-
-def _normalize_lrclib_query_text(text: str | None) -> str:
-    normalized = str(text or "").strip()
-    if not normalized:
-        return ""
-    return RE_HYPHEN_VARIANTS.sub("-", normalized)
-
-
 class LRCLIBProvider(OnlineLyricProvider):
     source_name = "lrclib"
 
@@ -106,9 +97,9 @@ class LRCLIBProvider(OnlineLyricProvider):
         limit: int = SEARCH_LIMIT,
     ) -> list[SearchCandidate]:
         query_variants: list[dict[str, str]] = []
-        normalized_title = _normalize_lrclib_query_text(title)
-        normalized_artist = _normalize_lrclib_query_text(artist)
-        normalized_album = _normalize_lrclib_query_text(album)
+        normalized_title = normalize_search_text(title)
+        normalized_artist = normalize_search_text(artist)
+        normalized_album = normalize_search_text(album)
         for track_name, artist_name, album_name in [
             (title, artist or "", album or ""),
             (normalized_title, normalized_artist or artist or "", normalized_album or album or ""),
@@ -117,8 +108,8 @@ class LRCLIBProvider(OnlineLyricProvider):
         ]:
             params = {
                 "track_name": str(track_name or "").strip(),
-                "artist_name": str(artist_name or "").strip(),
-                "album_name": str(album_name or "").strip(),
+                "artist_name": clean_text(artist_name),
+                "album_name": clean_text(album_name),
             }
             if not params["track_name"]:
                 continue
