@@ -5,7 +5,7 @@ import copy
 import io
 import sys
 import traceback
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +29,8 @@ from Lazulite.Debug import (
 from Lazulite.Lyric import LyricLineStamp, LyricTokenLine
 from Lazulite.Search.Common import build_search_text_variants
 from Lazulite.Search import NeteaseProvider, build_default_provider_registry
+from Lazulite.Search.LyricMatch import LyricContentMatcher
+from Lazulite.Search.Provider import FetchedLyricCandidate, SearchCandidate
 
 
 @dataclass
@@ -39,6 +41,15 @@ class AudioMetadata:
     album: str | None
     duration: float
     raw_tags: dict[str, Any]
+
+
+@dataclass
+class LyricSourceResolution:
+    lyric: LyricLineStamp | None
+    search_result: dict[str, Any] | None
+    candidate_pool: list[FetchedLyricCandidate] | None
+    candidate_pool_summary: dict[str, Any] | None
+    provider_by_source: dict[str, Any] | None
 
 
 def _first_text(value: Any) -> str | None:
@@ -95,33 +106,42 @@ def read_audio_metadata(audio_path: str | Path) -> AudioMetadata:
     )
 
 
-def search_lyric_from_metadata(
+def _is_effectively_empty_lyric(
+    lyric: LyricLineStamp | None,
+    min_lyric_lines: int,
+) -> bool:
+    if lyric is None:
+        return True
+    return len(getattr(lyric, "lyric_lines", [])) <= int(min_lyric_lines)
+
+
+def search_lyric_candidates_from_metadata(
     metadata: AudioMetadata,
     netease_song_id: str | int | None = None,
     min_search_score: float = 55.0,
     search_workers: int = 4,
-    min_lyric_lines: int = 3,
-) -> tuple[LyricLineStamp, dict[str, Any]]:
-    def _is_effectively_empty_lyric(lyric: LyricLineStamp | None) -> bool:
-        if lyric is None:
-            return True
-        return len(getattr(lyric, "lyric_lines", [])) <= int(min_lyric_lines)
-
+    per_source_limit: int = 3,
+) -> dict[str, Any]:
     if netease_song_id is not None:
         provider = NeteaseProvider()
-        lyric = provider.fetch_lyric_by_song_id(netease_song_id)
-        if _is_effectively_empty_lyric(lyric):
-            raise RuntimeError(
-                f"未能获取 netease_song_id={netease_song_id} 对应的有效歌词；"
-                f"歌词行数需大于 {int(min_lyric_lines)}"
-            )
-        return lyric, {
-            "source": provider.source_name,
-            "candidate_id": str(netease_song_id),
-            "title": metadata.title,
-            "artist": metadata.artist,
-            "album": metadata.album,
-            "match_score": None,
+        candidate = SearchCandidate(
+            source=provider.source_name,
+            candidate_id=str(netease_song_id),
+            title=metadata.title or "",
+            artist=metadata.artist,
+            album=metadata.album,
+            duration=metadata.duration,
+            match_score=100.0,
+        )
+        return {
+            "providers": [provider],
+            "provider_by_source": {provider.source_name: provider},
+            "provider_candidates": {provider.source_name: [candidate]},
+            "best_score_by_source": {provider.source_name: 100.0},
+            "top_candidate_by_source": {
+                provider.source_name: candidate.to_dict(),
+            },
+            "per_source_limit": 1,
         }
 
     if not metadata.title:
@@ -129,7 +149,6 @@ def search_lyric_from_metadata(
 
     best_score_by_source: dict[str, float] = {}
     top_candidate_by_source: dict[str, dict[str, Any]] = {}
-    attempted_by_source: dict[str, list[str]] = {}
     providers = build_default_provider_registry()
     provider_by_source = {
         provider.source_name: provider
@@ -142,8 +161,6 @@ def search_lyric_from_metadata(
         artist_variants = [metadata.artist or ""]
     if not album_variants:
         album_variants = [metadata.album or ""]
-
-    qualified_candidates_all: list[Any] = []
 
     def _search_provider_candidates(provider):
         deduped_candidates: dict[str, Any] = {}
@@ -195,117 +212,10 @@ def search_lyric_from_metadata(
 
     for source_name, candidates in provider_results:
         if not candidates:
-            attempted_by_source[source_name] = []
             continue
 
         best_score_by_source[source_name] = float(candidates[0].match_score)
         top_candidate_by_source[source_name] = candidates[0].to_dict()
-        qualified_candidates = [
-            candidate
-            for candidate in candidates
-            if float(candidate.match_score) >= min_search_score
-        ]
-        attempted_by_source[source_name] = []
-        qualified_candidates_all.extend(qualified_candidates)
-
-    provider_order = {
-        provider.source_name: index
-        for index, provider in enumerate(providers)
-    }
-    provider_priority = {
-        provider.source_name: int(getattr(provider, "priority", 100))
-        for provider in providers
-    }
-    qualified_candidates_all.sort(
-        key=lambda candidate: (
-            -provider_priority.get(candidate.source, 100),
-            -float(candidate.match_score),
-            provider_order.get(candidate.source, len(provider_order)),
-        )
-    )
-
-    active_priority = None if not qualified_candidates_all else max(
-        provider_priority.get(candidate.source, 100)
-        for candidate in qualified_candidates_all
-    )
-    active_candidates = [
-        candidate
-        for candidate in qualified_candidates_all
-        if provider_priority.get(candidate.source, 100) == active_priority
-    ]
-    lower_priority_candidates = [
-        candidate
-        for candidate in qualified_candidates_all
-        if provider_priority.get(candidate.source, 100) < int(active_priority)
-    ] if active_priority is not None else []
-
-    plain_text_fallback: tuple[LyricLineStamp, dict[str, Any]] | None = None
-
-    def _fetch_candidates(
-        candidates: list[Any],
-        allow_plain_text_return: bool,
-    ) -> tuple[tuple[LyricLineStamp, dict[str, Any]] | None, tuple[LyricLineStamp, dict[str, Any]] | None]:
-        plain_fallback: tuple[LyricLineStamp, dict[str, Any]] | None = None
-        for candidate in candidates:
-            attempted_by_source.setdefault(candidate.source, []).append(
-                f"{candidate.candidate_id}({candidate.match_score:.1f})"
-            )
-            provider = provider_by_source[candidate.source]
-            try:
-                lyric = provider.fetch_lyric(candidate)
-            except Exception as exc:
-                warnings.warn(
-                    f"在线歌词候选获取失败，已跳过 source={provider.source_name} candidate={candidate.candidate_id}: {exc}",
-                    RuntimeWarning,
-                )
-                lyric = None
-            if _is_effectively_empty_lyric(lyric):
-                warnings.warn(
-                    "在线歌词候选返回空歌词或歌词行数过少，已跳过 "
-                    f"source={provider.source_name} candidate={candidate.candidate_id} "
-                    f"(min_lyric_lines={int(min_lyric_lines)})",
-                    RuntimeWarning,
-                )
-                lyric = None
-            if lyric is None:
-                continue
-
-            candidate_info = candidate.to_dict()
-            if getattr(lyric, "has_real_timestamps", True):
-                return (lyric, candidate_info), plain_fallback
-            if allow_plain_text_return and plain_fallback is None:
-                plain_fallback = (lyric, candidate_info)
-        return None, plain_fallback
-
-    result, plain_text_fallback = _fetch_candidates(
-        active_candidates,
-        allow_plain_text_return=True,
-    )
-    if result is not None:
-        return result
-
-    if plain_text_fallback is not None and lower_priority_candidates:
-        result, _ = _fetch_candidates(
-            lower_priority_candidates,
-            allow_plain_text_return=False,
-        )
-        if result is not None:
-            return result
-
-    if plain_text_fallback is not None:
-        return plain_text_fallback
-
-    result, _ = _fetch_candidates(
-        lower_priority_candidates,
-        allow_plain_text_return=False,
-    )
-    if result is not None:
-        return result
-
-    attempted_by_source = {
-        source: list(dict.fromkeys(values))
-        for source, values in attempted_by_source.items()
-    }
 
     if best_score_by_source:
         summary = ", ".join(
@@ -331,21 +241,188 @@ def search_lyric_from_metadata(
                 f"最高分候选: {candidate_summary}；"
                 "请改用 --netease-song-id 或手动提供 --lyric-path"
             )
-    else:
-        candidate_summary = ""
+    provider_candidates = {
+        source_name: [
+            candidate
+            for candidate in candidates
+            if float(candidate.match_score) >= min_search_score
+        ][:max(1, int(per_source_limit)) * 4]
+        for source_name, candidates in provider_results
+        if candidates and any(float(candidate.match_score) >= min_search_score for candidate in candidates)
+    }
+    if provider_candidates:
+        return {
+            "providers": providers,
+            "provider_by_source": provider_by_source,
+            "provider_candidates": provider_candidates,
+            "best_score_by_source": best_score_by_source,
+            "top_candidate_by_source": top_candidate_by_source,
+            "per_source_limit": max(1, int(per_source_limit)),
+        }
 
-    attempted_fragments = [
-        f"{source}: {', '.join(values)}"
-        for source, values in attempted_by_source.items()
-        if values
-    ]
-    if attempted_fragments:
-        raise RuntimeError(
-            "已尝试所有分数达标的在线歌词候选，但都未能获取歌词；"
-            f"尝试过的候选: {'; '.join(attempted_fragments)}"
-            + (f"；各平台最高分候选: {candidate_summary}" if candidate_summary else "")
+    raise RuntimeError("歌词搜索没有返回任何分数达标的候选结果")
+
+
+def fetch_lyric_candidate_pool(
+    *,
+    provider_candidates: dict[str, list[SearchCandidate]],
+    provider_by_source: dict[str, Any],
+    min_lyric_lines: int,
+    per_source_limit: int,
+    fetch_workers: int,
+) -> tuple[list[FetchedLyricCandidate], dict[str, Any]]:
+    valid_by_source: dict[str, list[FetchedLyricCandidate]] = {
+        source: []
+        for source in provider_candidates
+    }
+    attempted_by_source: dict[str, list[str]] = {
+        source: []
+        for source in provider_candidates
+    }
+    next_index_by_source = {source: 0 for source in provider_candidates}
+    pending_by_source = {source: 0 for source in provider_candidates}
+    future_map: dict[Future, tuple[str, SearchCandidate, int]] = {}
+
+    def _submit_next(source_name: str, executor: ThreadPoolExecutor) -> bool:
+        candidates = provider_candidates.get(source_name) or []
+        next_index = next_index_by_source[source_name]
+        if next_index >= len(candidates):
+            return False
+        candidate = candidates[next_index]
+        next_index_by_source[source_name] += 1
+        pending_by_source[source_name] += 1
+        future = executor.submit(provider_by_source[source_name].fetch_lyric, candidate)
+        future_map[future] = (source_name, candidate, next_index + 1)
+        return True
+
+    max_fetch_workers = max(
+        1,
+        min(
+            int(fetch_workers),
+            max(sum(min(len(items), per_source_limit) for items in provider_candidates.values()), 1),
+        ),
+    )
+    with ThreadPoolExecutor(max_workers=max_fetch_workers, thread_name_prefix="lyric-fetch") as executor:
+        for source_name, candidates in provider_candidates.items():
+            initial_count = min(per_source_limit, len(candidates))
+            for _ in range(initial_count):
+                _submit_next(source_name, executor)
+
+        while future_map:
+            completed = next(as_completed(list(future_map.keys())))
+            source_name, candidate, provider_rank = future_map.pop(completed)
+            pending_by_source[source_name] = max(0, pending_by_source[source_name] - 1)
+            attempted_by_source[source_name].append(
+                f"{candidate.candidate_id}({float(candidate.match_score):.1f})"
+            )
+            try:
+                lyric = completed.result()
+            except Exception as exc:
+                warnings.warn(
+                    "在线歌词候选获取失败，已跳过 "
+                    f"source={source_name} candidate={candidate.candidate_id}: {exc}",
+                    RuntimeWarning,
+                )
+                lyric = None
+
+            if _is_effectively_empty_lyric(lyric, min_lyric_lines=min_lyric_lines):
+                if lyric is not None:
+                    warnings.warn(
+                        "在线歌词候选返回空歌词或歌词行数过少，已跳过 "
+                        f"source={source_name} candidate={candidate.candidate_id} "
+                        f"(min_lyric_lines={int(min_lyric_lines)})",
+                        RuntimeWarning,
+                    )
+                lyric = None
+
+            if lyric is not None and len(valid_by_source[source_name]) < per_source_limit:
+                valid_by_source[source_name].append(
+                    FetchedLyricCandidate(
+                        candidate=candidate,
+                        lyric=lyric,
+                        provider_rank=provider_rank,
+                        lyric_line_count=len(lyric.lyric_lines),
+                    )
+                )
+
+            while (
+                len(valid_by_source[source_name]) + pending_by_source[source_name] < per_source_limit
+                and _submit_next(source_name, executor)
+            ):
+                pass
+
+    candidate_pool = []
+    for source_name, items in valid_by_source.items():
+        items.sort(key=lambda item: item.provider_rank)
+        candidate_pool.extend(items[:per_source_limit])
+
+    candidate_pool.sort(
+        key=lambda item: (
+            -int(getattr(provider_by_source[item.candidate.source], "priority", 100)),
+            item.provider_rank,
+            -float(item.candidate.match_score),
         )
-    raise RuntimeError("歌词搜索没有返回任何可用候选结果")
+    )
+    summary = {
+        "attempted_by_source": {
+            source: list(dict.fromkeys(values))
+            for source, values in attempted_by_source.items()
+            if values
+        },
+        "valid_count_by_source": {
+            source: len(values)
+            for source, values in valid_by_source.items()
+        },
+    }
+    return candidate_pool, summary
+
+
+def select_lyric_from_candidate_pool(
+    *,
+    candidate_pool: list[FetchedLyricCandidate],
+    transcription,
+    provider_by_source: dict[str, Any],
+) -> tuple[LyricLineStamp, dict[str, Any]]:
+    matcher = LyricContentMatcher()
+    ranked_items: list[tuple[float, dict[str, Any], FetchedLyricCandidate]] = []
+    for item in candidate_pool:
+        match_result = matcher.score(item.lyric, transcription)
+        metadata_score = float(item.candidate.match_score)
+        content_score = float(match_result.content_match_score) * 100.0
+        final_score = 0.55 * metadata_score + 0.45 * content_score
+        provider_priority = int(getattr(provider_by_source[item.candidate.source], "priority", 100))
+        candidate_info = item.to_dict()
+        candidate_info.update({
+            "metadata_score": metadata_score,
+            "content_match": match_result.to_dict(),
+            "content_match_score": content_score,
+            "final_score": final_score,
+            "provider_priority": provider_priority,
+        })
+        ranked_items.append((final_score, candidate_info, item))
+
+    if not ranked_items:
+        raise RuntimeError("在线歌词候选池为空，无法选择最终歌词")
+
+    qualified_items = [
+        value
+        for value in ranked_items
+        if float(value[1]["final_score"]) >= 55.0
+    ]
+    if qualified_items:
+        ranked_items = qualified_items
+
+    ranked_items.sort(
+        key=lambda value: (
+            -int(value[1]["provider_priority"]),
+            -float(value[0]),
+            int(value[1]["provider_rank"]),
+        )
+    )
+    _, best_info, best_item = ranked_items[0]
+    best_info["candidate_pool_size"] = len(candidate_pool)
+    best_info["ranked_candidates"] = [info for _, info, _ in ranked_items]
+    return best_item.lyric, best_info
 
 
 def _format_lrc_timestamp(seconds: float) -> str:
@@ -701,27 +778,60 @@ def _resolve_lyric_source(
     args: argparse.Namespace,
     audio_path: Path,
     metadata: AudioMetadata,
-) -> tuple[LyricLineStamp, dict[str, Any]]:
+) -> LyricSourceResolution:
     if args.lyric_path or args.read_metadata_lyric:
         lyric = load_alignment_lyric(args.lyric_path, music_path=str(audio_path))
         if lyric is None and args.lyric_path:
             raise RuntimeError(f"无法从本地歌词文件加载歌词: {args.lyric_path}")
         if lyric is not None:
-            return lyric, {
-                "source": "metadata" if args.read_metadata_lyric and not args.lyric_path else "local",
-                "candidate_id": None,
-                "title": metadata.title,
-                "artist": metadata.artist,
-                "album": metadata.album,
-                "match_score": None,
-            }
+            return LyricSourceResolution(
+                lyric=lyric,
+                search_result={
+                    "source": "metadata" if args.read_metadata_lyric and not args.lyric_path else "local",
+                    "candidate_id": None,
+                    "title": metadata.title,
+                    "artist": metadata.artist,
+                    "album": metadata.album,
+                    "match_score": None,
+                },
+                candidate_pool=None,
+                candidate_pool_summary=None,
+                provider_by_source=None,
+            )
 
-    return search_lyric_from_metadata(
+    search_result = search_lyric_candidates_from_metadata(
         metadata=metadata,
         netease_song_id=args.netease_song_id,
         min_search_score=args.min_search_score,
         search_workers=args.search_workers,
+    )
+    candidate_pool, candidate_pool_summary = fetch_lyric_candidate_pool(
+        provider_candidates=search_result["provider_candidates"],
+        provider_by_source=search_result["provider_by_source"],
         min_lyric_lines=args.min_lyric_lines,
+        per_source_limit=int(search_result["per_source_limit"]),
+        fetch_workers=max(args.search_workers, int(search_result["per_source_limit"]) * 2),
+    )
+    if not candidate_pool:
+        attempted_fragments = [
+            f"{source}: {', '.join(values)}"
+            for source, values in (candidate_pool_summary or {}).get("attempted_by_source", {}).items()
+            if values
+        ]
+        raise RuntimeError(
+            "已尝试所有分数达标的在线歌词候选，但都未能获取歌词；"
+            + (f"尝试过的候选: {'; '.join(attempted_fragments)}" if attempted_fragments else "")
+        )
+    return LyricSourceResolution(
+        lyric=None,
+        search_result={
+            "source": "online",
+            "candidate_pool_size": len(candidate_pool),
+            "best_score_by_source": search_result.get("best_score_by_source") or {},
+        },
+        candidate_pool=candidate_pool,
+        candidate_pool_summary=candidate_pool_summary,
+        provider_by_source=search_result["provider_by_source"],
     )
 
 
@@ -749,7 +859,7 @@ def process_audio_file(args: argparse.Namespace, audio_path: str | Path) -> None
     aligner = LyricAligner()
     offset_aligner = OffsetAligner()
     lyric_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lyric-search")
-    lyric_future: Future[tuple[LyricLineStamp, dict[str, Any]]] = lyric_executor.submit(
+    lyric_future: Future[LyricSourceResolution] = lyric_executor.submit(
         _resolve_lyric_source,
         args,
         audio_path,
@@ -763,6 +873,7 @@ def process_audio_file(args: argparse.Namespace, audio_path: str | Path) -> None
     offset_alignment_result = None
     offset_segment_indices: set[int] = set()
     offset_fallback_to = None
+    lyric_resolution: LyricSourceResolution | None = None
     lyric: LyricLineStamp | None = None
     search_result: dict[str, Any] | None = None
 
@@ -781,7 +892,61 @@ def process_audio_file(args: argparse.Namespace, audio_path: str | Path) -> None
 
         analyzer.release_model_if_needed()
 
-        lyric, search_result = lyric_future.result()
+        if args.align_mode in {"auto", "offset-only"}:
+            offset_segment_indices = select_offset_segment_indices(analysis_result)
+            print("Offset 预筛选:")
+            print(f"  candidate_segments={len(offset_segment_indices)}")
+            offset_transcriber = WhisperTranscriber(
+                model_id=args.model_id,
+                language=args.language,
+                prompt_mode="previous",
+                num_candidates=args.num_candidates,
+                enable_token_timestamps=False,
+                low_memory_mode=args.low_memory_mode,
+            )
+            offset_track_result = offset_transcriber.transcribe_analysis(
+                analysis_result=analysis_result,
+                lyric_hint=None,
+                segment_indices=offset_segment_indices,
+            )
+            print("Offset 预转写:")
+            print(f"  chunks={len(offset_track_result.chunks)}")
+            print(f"  stats={offset_track_result.stats}")
+        else:
+            dp_transcriber = WhisperTranscriber(
+                model_id=args.model_id,
+                language=args.language,
+                prompt_mode=args.prompt_mode,
+                num_candidates=args.num_candidates,
+                enable_token_timestamps=True,
+                low_memory_mode=args.low_memory_mode,
+            )
+            track_result = dp_transcriber.transcribe_analysis(
+                analysis_result=analysis_result,
+                lyric_hint=None,
+            )
+            print("DP 预转写:")
+            print(f"  chunks={len(track_result.chunks)}")
+            print(f"  stats={track_result.stats}")
+
+        lyric_resolution = lyric_future.result()
+        lyric = lyric_resolution.lyric
+        search_result = lyric_resolution.search_result or {}
+        if lyric is None:
+            candidate_pool = lyric_resolution.candidate_pool or []
+            print("歌词候选池:")
+            print(f"  fetched_candidates={len(candidate_pool)}")
+            valid_count_by_source = (lyric_resolution.candidate_pool_summary or {}).get("valid_count_by_source") or {}
+            if valid_count_by_source:
+                print(f"  valid_count_by_source={valid_count_by_source}")
+            preview_track = offset_track_result if offset_track_result is not None else track_result
+            if preview_track is None:
+                raise RuntimeError("歌词候选重排前缺少可用转写结果")
+            lyric, search_result = select_lyric_from_candidate_pool(
+                candidate_pool=candidate_pool,
+                transcription=preview_track,
+                provider_by_source=lyric_resolution.provider_by_source or {},
+            )
         print("歌词来源:")
         print(f"  source={search_result.get('source', 'netease')}")
         print(f"  candidate_id={search_result.get('candidate_id')}")
@@ -791,6 +956,12 @@ def process_audio_file(args: argparse.Namespace, audio_path: str | Path) -> None
         if search_result.get("duration") is not None:
             print(f"  candidate_duration={float(search_result['duration']):.2f}s")
         print(f"  match_score={search_result.get('match_score')}")
+        if search_result.get("metadata_score") is not None:
+            print(f"  metadata_score={float(search_result['metadata_score']):.2f}")
+        if search_result.get("content_match_score") is not None:
+            print(f"  content_match_score={float(search_result['content_match_score']):.2f}")
+        if search_result.get("final_score") is not None:
+            print(f"  final_score={float(search_result['final_score']):.2f}")
         print(f"  lyric_lines={len(lyric.lyric_lines)}")
 
         lyric_has_real_timestamps = getattr(lyric, "has_real_timestamps", True)
@@ -799,24 +970,7 @@ def process_audio_file(args: argparse.Namespace, audio_path: str | Path) -> None
             raise RuntimeError("offset-only 模式要求输入歌词包含真实时间戳；当前歌词为纯文本，请改用 auto、hybrid 或 dp-only")
 
         if args.align_mode in {"auto", "offset-only"} and lyric_has_real_timestamps:
-            offset_segment_indices = select_offset_segment_indices(analysis_result)
-            print("Offset 预筛选:")
-            print(f"  candidate_segments={len(offset_segment_indices)}")
-
-            offset_transcriber = WhisperTranscriber(
-                model_id=args.model_id,
-                language=args.language,
-                prompt_mode="previous",
-                num_candidates=args.num_candidates,
-                enable_token_timestamps=False,
-                low_memory_mode=args.low_memory_mode,
-            )
-            track_result = offset_transcriber.transcribe_analysis(
-                analysis_result=analysis_result,
-                lyric_hint=None,
-                segment_indices=offset_segment_indices,
-            )
-            offset_track_result = track_result
+            track_result = offset_track_result
             print("Offset 分片转写:")
             print(f"  chunks={len(track_result.chunks)}")
             print(f"  stats={track_result.stats}")
@@ -896,21 +1050,26 @@ def process_audio_file(args: argparse.Namespace, audio_path: str | Path) -> None
             if offset_transcriber is not None:
                 offset_transcriber.unload_model_if_needed()
 
-            dp_transcriber = WhisperTranscriber(
-                model_id=args.model_id,
-                language=args.language,
-                prompt_mode=args.prompt_mode,
-                num_candidates=args.num_candidates,
-                enable_token_timestamps=True,
-                low_memory_mode=args.low_memory_mode,
-            )
-            track_result = dp_transcriber.transcribe_analysis(
-                analysis_result=analysis_result,
-                lyric_hint=lyric,
-            )
-            print("DP 分片转写:")
-            print(f"  chunks={len(track_result.chunks)}")
-            print(f"  stats={track_result.stats}")
+            if track_result is None or args.align_mode == "auto":
+                dp_transcriber = WhisperTranscriber(
+                    model_id=args.model_id,
+                    language=args.language,
+                    prompt_mode=args.prompt_mode,
+                    num_candidates=args.num_candidates,
+                    enable_token_timestamps=True,
+                    low_memory_mode=args.low_memory_mode,
+                )
+                track_result = dp_transcriber.transcribe_analysis(
+                    analysis_result=analysis_result,
+                    lyric_hint=lyric,
+                )
+                print("DP 分片转写:")
+                print(f"  chunks={len(track_result.chunks)}")
+                print(f"  stats={track_result.stats}")
+            else:
+                print("DP 分片转写:")
+                print(f"  chunks={len(track_result.chunks)}")
+                print(f"  stats={track_result.stats}")
 
             alignment_result = aligner.align(lyric=lyric, transcription=track_result)
             if args.align_mode == "auto":

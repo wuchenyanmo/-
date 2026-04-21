@@ -31,6 +31,23 @@ class SearchCandidate:
         }
 
 
+@dataclass(slots=True)
+class FetchedLyricCandidate:
+    candidate: SearchCandidate
+    lyric: LyricLineStamp
+    provider_rank: int
+    lyric_line_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = self.candidate.to_dict()
+        payload.update({
+            "provider_rank": self.provider_rank,
+            "lyric_line_count": self.lyric_line_count,
+            "has_real_timestamps": bool(getattr(self.lyric, "has_real_timestamps", True)),
+        })
+        return payload
+
+
 class OnlineLyricProvider(ABC):
     source_name: str
     priority: int = 100
